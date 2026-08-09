@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        txt format (DOM优化版)
 // @namespace   http://tampermonkey.net/
-// @version     2026-08-09.06
+// @version     2026-08-09.07
 // @description 智能格式化txt文件：自动识别章节标题、清理异常字符、保留章节标题空格，支持暗色模式与EPUB导出。版本历史见脚本头部注释。
 // @author      yolo
 // @match       file://*/*.txt
@@ -21,6 +21,7 @@
  * v7.34         章节标题中的空格保留，正文汉字间空格仍清理
  * 2026-08-09.05 版本号统一：PARSER_VERSION 由 @version 自动派生，不再单独维护
  * 2026-08-09.06 启动时自动清理旧版本的渲染缓存，避免 IndexedDB 无限累积
+ * 2026-08-09.07 自动统一章节编号风格（阿拉伯/中文混排、前导零），章节识别支持 零/百/千
  */
 
 (function () {
@@ -182,6 +183,8 @@
                     .replace(/(?<=[\u4e00-\u9fa5]),(?:[ \t\u3000]*)(?=[\u4e00-\u9fa5])/g, '，')
                     .replace(/(\d)。(\d+)/g, '$1.$2')
                     .replace(/。{2,}/g, '……');
+                // 统一章节编号风格（阿拉伯/中文混排、前导零）
+                text = normalizeChapterNumbers(text);
             }
 
             const rawParas = stitchContinuousLines(text);
@@ -547,9 +550,114 @@
 
         const HOLDER = '\uE000'; // 临时占位符（sanitizeText 已执行，不会再被清理）
         return String(text)
-            .replace(/(第\s*[\d一二三四五六七八九十]+\s*(?:卷|章|回|集|部|篇)|序章|尾声)[ \t\u3000]+/g, '$1' + HOLDER)
+            .replace(/(第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇)|序章|尾声)[ \t\u3000]+/g, '$1' + HOLDER)
             .replace(/([\u4e00-\u9fa5])[ \t\u3000]+(?=[\u4e00-\u9fa5])/g, '$1')
             .replace(/\uE000/g, ' ');
+    }
+
+    /**
+     * 统一章节编号风格。
+     * 1. 先统计全书“第X章/卷/回/集/部/篇”使用的是阿拉伯数字还是中文数字；
+     * 2. 以占多数的风格为准统一：阿拉伯风格去掉前导零（第032章→第32章），
+     *    中文风格则把阿拉伯数字转成中文数字（第34章→第三十四章）；
+     * 3. 平票时默认使用阿拉伯数字。
+     */
+    function normalizeChapterNumbers(text) {
+        const tokenRe = /第\s*([\d０-９〇零一二三四五六七八九十百千万两]+)\s*(章|卷|回|集|部|篇)/g;
+        const hasChineseDigit = (s) => /[〇零一二三四五六七八九十百千万两]/.test(s);
+        const toAsciiDigits = (s) => s.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 65248));
+
+        // 第一遍：统计风格并记录所有编号位置
+        const tokens = [];
+        let arabic = 0;
+        let chinese = 0;
+        let m;
+        tokenRe.lastIndex = 0;
+        while ((m = tokenRe.exec(text)) !== null) {
+            const numStr = m[1];
+            const style = hasChineseDigit(numStr) ? 'chinese' : 'arabic';
+            if (style === 'chinese') chinese++; else arabic++;
+            tokens.push({ start: m.index, end: m.index + m[0].length, numStr, unit: m[2], style });
+        }
+        if (tokens.length === 0) return text;
+
+        const useArabic = arabic >= chinese; // 平票默认阿拉伯数字
+
+        // 第二遍：按原顺序重写文本
+        let result = '';
+        let last = 0;
+        for (const t of tokens) {
+            result += text.slice(last, t.start);
+            let number;
+            if (t.style === 'arabic') {
+                number = parseInt(toAsciiDigits(t.numStr), 10);
+            } else {
+                number = chineseNumToInt(t.numStr);
+            }
+            if (!isNaN(number)) {
+                result += '第' + (useArabic ? String(number) : intToChineseNum(number)) + t.unit;
+            } else {
+                result += text.slice(t.start, t.end); // 解析失败则保留原文
+            }
+            last = t.end;
+        }
+        result += text.slice(last);
+        return result;
+    }
+
+    /**
+     * 中文数字转整数（支持 零一二三四五六七八九十百千万 及 两、〇）。
+     * 例：三十二→32，一百零三→103，一万二千→12000。
+     */
+    function chineseNumToInt(str) {
+        const digitMap = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+        const unitVal = { 十: 10, 百: 100, 千: 1000, 万: 10000, 亿: 100000000 };
+        let result = 0;
+        let section = 0;
+        let num = 0;
+        for (const ch of str) {
+            if (Object.prototype.hasOwnProperty.call(digitMap, ch)) {
+                num = digitMap[ch];
+            } else if (Object.prototype.hasOwnProperty.call(unitVal, ch)) {
+                const v = unitVal[ch];
+                if (v >= 10000) {
+                    result += (section + num) * v;
+                    section = 0;
+                    num = 0;
+                } else {
+                    section += (num || 1) * v;
+                    num = 0;
+                }
+            }
+        }
+        return result + section + num;
+    }
+
+    /**
+     * 整数转中文数字（支持 1~9999；≥10000 时保留数字原文）。
+     * 例：32→三十二，103→一百零三，10→十。
+     */
+    function intToChineseNum(num) {
+        if (num === 0) return '零';
+        if (num >= 10000) return String(num);
+        const digit = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+        const unit = ['', '十', '百', '千'];
+        const s = String(num);
+        let out = '';
+        let zeroPending = false;
+        for (let i = 0; i < s.length; i++) {
+            const d = parseInt(s[i], 10);
+            const pos = s.length - 1 - i;
+            if (d === 0) {
+                zeroPending = true;
+            } else {
+                if (zeroPending && out !== '') out += '零';
+                zeroPending = false;
+                out += digit[d] + unit[pos];
+            }
+        }
+        if (out.startsWith('一十')) out = out.slice(1);
+        return out;
     }
 
     function stitchContinuousLines(text) {
@@ -568,7 +676,7 @@
     const isTitle = (str) => {
         const t = str.trim();
         if (t.length === 0) return false;
-        if (/^第\s*[\d一二三四五六七八九十]+\s*(?:卷|章|回|集|部|篇)/.test(t)) {
+        if (/^第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇)/.test(t)) {
             return t.length < 300;
         }
         if (t.length > 100) return false;
@@ -624,7 +732,7 @@
     function splitInternalChapters(paragraphs) {
         const result = [];
         // 匹配：句末标点或右引号/括号后紧跟“第X章/卷/回/集/部/篇”
-        const chapterSplitter = /([。！？…\u2026”」』）】》〉〕\]\}｝］]) *(第\s*[\d一二三四五六七八九十]+\s*(?:卷|章|回|集|部|篇))/g;
+        const chapterSplitter = /([。！？…\u2026”」』）】》〉〕\]\}｝］]) *(第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇))/g;
 
         for (const para of paragraphs) {
             // 先收集段落内所有章节标记，避免边遍历边推进时文本重复
@@ -659,7 +767,7 @@
     }
 
     function trySplitChapterLine(text) {
-        const match = text.match(/^(第\s*[\d一二三四五六七八九十]+\s*(?:卷|章|回|集|部|篇))\s*(.*)$/);
+        const match = text.match(/^(第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇))\s*(.*)$/);
         if (!match) return null;
         const prefix = match[1].trim();
         const suffix = match[2] ? match[2].trim() : '';
@@ -696,7 +804,7 @@
         if (index < 10 && (/^《.+》/.test(t) || /^书名[:：]/.test(t) || (/作者[:：]/.test(t) && t.length < 50))) { const h1 = document.createElement('h1'); h1.textContent = t; container.appendChild(h1); return; }
 
         // 章节标题智能拆分
-        const chapterPattern = /^第\s*[\d一二三四五六七八九十]+\s*(?:卷|章|回|集|部|篇)/;
+        const chapterPattern = /^第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇)/;
         if (chapterPattern.test(t)) {
             const split = trySplitChapterLine(t);
             if (split) {
