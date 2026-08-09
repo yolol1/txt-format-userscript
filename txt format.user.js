@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        txt format (DOM优化版)
 // @namespace   http://tampermonkey.net/
-// @version     2026-08-09.07
+// @version     2026-08-09.08
 // @description 智能格式化txt文件：自动识别章节标题、清理异常字符、保留章节标题空格，支持暗色模式与EPUB导出。版本历史见脚本头部注释。
 // @author      yolo
 // @match       file://*/*.txt
@@ -22,6 +22,7 @@
  * 2026-08-09.05 版本号统一：PARSER_VERSION 由 @version 自动派生，不再单独维护
  * 2026-08-09.06 启动时自动清理旧版本的渲染缓存，避免 IndexedDB 无限累积
  * 2026-08-09.07 自动统一章节编号风格（阿拉伯/中文混排、前导零），章节识别支持 零/百/千
+ * 2026-08-09.08 阿拉伯章节编号自动识别“前导零补齐”风格并按全书位数统一（如 032/232 均为 3 位）
  */
 
 (function () {
@@ -558,8 +559,10 @@
     /**
      * 统一章节编号风格。
      * 1. 先统计全书“第X章/卷/回/集/部/篇”使用的是阿拉伯数字还是中文数字；
-     * 2. 以占多数的风格为准统一：阿拉伯风格去掉前导零（第032章→第32章），
-     *    中文风格则把阿拉伯数字转成中文数字（第34章→第三十四章）；
+     * 2. 以占多数的风格为准统一：
+     *    - 阿拉伯风格默认去掉前导零；若全书存在前导零补齐风格（如 032、034），
+     *      则统一按最大位数补齐（032/232 → 3 位）；
+     *    - 中文风格把阿拉伯数字转成中文数字（第34章→第三十四章）；
      * 3. 平票时默认使用阿拉伯数字。
      */
     function normalizeChapterNumbers(text) {
@@ -583,6 +586,22 @@
 
         const useArabic = arabic >= chinese; // 平票默认阿拉伯数字
 
+        // 检测阿拉伯编号的前导零补齐风格：
+        // 只要存在带前导零的编号（如 032），且全书阿拉伯编号最大位数为 W，
+        // 就认为这本书习惯用 W 位补齐（032/232 都是 3 位），统一按 W 位输出。
+        let padWidth = 0;
+        if (useArabic) {
+            let hasLeadingZero = false;
+            let maxWidth = 0;
+            for (const t of tokens) {
+                if (t.style !== 'arabic') continue;
+                const digits = toAsciiDigits(t.numStr);
+                if (digits.length > 1 && digits[0] === '0') hasLeadingZero = true;
+                maxWidth = Math.max(maxWidth, digits.length);
+            }
+            if (hasLeadingZero && maxWidth > 1) padWidth = maxWidth;
+        }
+
         // 第二遍：按原顺序重写文本
         let result = '';
         let last = 0;
@@ -595,7 +614,13 @@
                 number = chineseNumToInt(t.numStr);
             }
             if (!isNaN(number)) {
-                result += '第' + (useArabic ? String(number) : intToChineseNum(number)) + t.unit;
+                let numText;
+                if (useArabic) {
+                    numText = padWidth > 0 ? String(number).padStart(padWidth, '0') : String(number);
+                } else {
+                    numText = intToChineseNum(number);
+                }
+                result += '第' + numText + t.unit;
             } else {
                 result += text.slice(t.start, t.end); // 解析失败则保留原文
             }
