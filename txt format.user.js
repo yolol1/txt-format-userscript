@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        txt format (DOM优化版)
 // @namespace   http://tampermonkey.net/
-// @version     2026-08-09.08
+// @version     2026-08-11.17
 // @description 智能格式化txt文件：自动识别章节标题、清理异常字符、保留章节标题空格，支持暗色模式与EPUB导出。版本历史见脚本头部注释。
 // @author      yolo
 // @match       file://*/*.txt
@@ -23,6 +23,23 @@
  * 2026-08-09.06 启动时自动清理旧版本的渲染缓存，避免 IndexedDB 无限累积
  * 2026-08-09.07 自动统一章节编号风格（阿拉伯/中文混排、前导零），章节识别支持 零/百/千
  * 2026-08-09.08 阿拉伯章节编号自动识别“前导零补齐”风格并按全书位数统一（如 032/232 均为 3 位）
+ * 2026-08-09.09 支持“卷名 + 第X回 + 标题”式标题识别（如“龙潜于渊 第一回 临安会”），
+ *               标题内空格全部保留；同时收紧“第X章”开头的多重标记正文句误判
+ * 2026-08-09.10 侧边栏目录超长标题单行省略显示，悬停可看完整标题，避免目录长短不一
+ * 2026-08-09.11 修复“（数字）”式标题误判：括号编号后带句读标点或过长时按正文处理，
+ *               避免把“（六）杨门女将……，……”这类长段落误切成标题
+ * 2026-08-09.12 支持“（数字）标题”与正文粘连的自动拆分：结合跨行延续词（之际/之时……）
+ *               与正文起始词词典（正当/却说/话说……），拆出短标题与正文，如“（六）杨门女将”
+ * 2026-08-09.13 修复“（数字）”标题误收手打分隔符：剥离标题首尾的星号/横线等分隔符串
+ *               （如“（十）＊＊＊＊＊＊”只取“（十）”），粘连拆分时标题部分同样禁止含分隔符
+ * 2026-08-09.14 修复侧边栏被超长标题撑宽：给侧边栏加最大宽度（260px）与 min-width: 0，
+ *               防止单行省略的 nowrap 内容把侧边栏拉伸到正文宽度
+ * 2026-08-09.15 重做暗色模式配色：暖色低眩光纸面、柔和正文色；当前章节改为暖色高亮条
+ *               + 浅色文字，修复白字浅底看不清的问题
+ * 2026-08-09.16 拆分段落内残留的空隙（连续 2 个及以上空格/全角空格），
+ *               把被并进同一行的对话回合恢复为独立段落，如“……？」　　「……”
+ * 2026-08-11.17 拆分无空隙直接粘连的对话回合（如“……”“……”），
+ *               多人对话按回合独立成段，避免全部挤在一段里影响阅读
  */
 
 (function () {
@@ -39,24 +56,26 @@
       :root {
           --main-accent-color: #5d4037;
           --highlight-color: #b71c1c;
+          --accent-bg: #b71c1c;
           --paper-bg: #f3eacb;
           --outer-bg: #e3d9be;
           --text-color: #3e2723;
           --sidebar-bg: #f9f3df;
       }
       body.dark-mode {
-          --paper-bg: #2c2c2c;
-          --outer-bg: #1e1e1e;
-          --text-color: #dcdcdc;
-          --sidebar-bg: #2a2a2a;
-          --main-accent-color: #bcaaa4;
-          --highlight-color: #ef9a9a;
+          --paper-bg: #221e18;
+          --outer-bg: #161310;
+          --text-color: #d8d2c4;
+          --sidebar-bg: #1b1814;
+          --main-accent-color: #c9b79a;
+          --highlight-color: #e0a37a;
+          --accent-bg: #a94f2e;
       }
       body { margin: 0; background-color: var(--outer-bg); font-family: "Source Han Serif SC","PingFang SC", "Microsoft YaHei", sans-serif; color: var(--text-color); overflow: hidden; }
       #reader-app { display: flex; height: 100vh; width: 100vw; overflow: hidden; }
-      .sidebar { flex: 0 0 260px; height: 100%; display: flex; flex-direction: column; background: var(--sidebar-bg); border-right: 1px dashed rgba(93, 64, 55, 0.2); z-index: 100; box-sizing: border-box; }
+      .sidebar { flex: 0 0 260px; min-width: 0; max-width: 260px; height: 100%; display: flex; flex-direction: column; background: var(--sidebar-bg); border-right: 1px dashed rgba(93, 64, 55, 0.2); z-index: 100; box-sizing: border-box; overflow: hidden; }
       .sidebar-header { padding: 20px 20px 10px 20px; border-bottom: 1px solid rgba(93, 64, 55, 0.1); }
-      .export-btn { display: flex; align-items: center; justify-content: center; width: 100%; padding: 10px; background-color: var(--highlight-color); color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; transition: background 0.3s, transform 0.1s; box-shadow: 0 2px 6px rgba(183, 28, 28, 0.2); }
+      .export-btn { display: flex; align-items: center; justify-content: center; width: 100%; padding: 10px; background-color: var(--accent-bg); color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; transition: background 0.3s, transform 0.1s; box-shadow: 0 2px 6px rgba(183, 28, 28, 0.2); }
       .export-btn:hover { background-color: #9a1616; transform: translateY(-1px); }
       .export-btn:active { transform: translateY(1px); }
       .export-btn:disabled { background-color: #ccc; cursor: not-allowed; box-shadow: none; transform: none; }
@@ -64,10 +83,10 @@
       .sidebar-content { flex: 1; overflow-y: auto; padding: 15px 20px 30px 20px; scrollbar-width: thin; scrollbar-color: rgba(93, 64, 55, 0.3) transparent; }
       .sidebar-content::-webkit-scrollbar { width: 6px; }
       .sidebar-content::-webkit-scrollbar-thumb { background-color: rgba(93, 64, 55, 0.3); border-radius: 3px; }
-      .sidebar-content a { text-decoration: none; color: #6d4c41; display: block; padding: 6px 10px; border-radius: 6px; transition: all 0.2s; margin-bottom: 4px; font-size: 14px; line-height: 1.4; }
+      .sidebar-content a { text-decoration: none; color: #6d4c41; display: block; padding: 6px 10px; border-radius: 6px; transition: all 0.2s; margin-bottom: 4px; font-size: 14px; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .sidebar-content a:hover { color: #3e2723; background: rgba(93, 64, 55, 0.1); }
-      .sidebar-content a.current-chapter { color: #fff; background-color: var(--highlight-color); font-weight: bold; box-shadow: 0 2px 6px rgba(183, 28, 28, 0.3); }
-      .main-wrapper { flex: 1; height: 100%; background-color: var(--outer-bg); padding: 3vh 3vw; box-sizing: border-box; display: flex; justify-content: center; }
+      .sidebar-content a.current-chapter { color: #fff; background-color: var(--accent-bg); font-weight: bold; box-shadow: 0 2px 6px rgba(183, 28, 28, 0.3); }
+      .main-wrapper { flex: 1; min-width: 0; height: 100%; background-color: var(--outer-bg); padding: 3vh 3vw; box-sizing: border-box; display: flex; justify-content: center; }
       .paper-container { width: 100%; max-width: 850px; height: 100%; background-color: var(--paper-bg); border-radius: 12px; box-shadow: 0 8px 30px rgba(93, 64, 55, 0.15); display: flex; flex-direction: column; overflow: hidden; position: relative; }
       .scroll-area { flex: 1; overflow-y: auto; scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: rgba(93, 64, 55, 0.2) transparent; }
       .scroll-area::-webkit-scrollbar { width: 6px; }
@@ -82,12 +101,22 @@
       .custom-divider::after { content: "❖"; position: absolute; top: -10px; left: 50%; transform: translateX(-50%); background-color: var(--paper-bg); padding: 0 10px; color: rgba(93, 64, 55, 0.6); font-size: 14px; }
       #reading-progress-bar { position: absolute; top: 0; left: 0; right: 0; height: 4px; background: var(--highlight-color); transform-origin: 0 50%; transform: scaleX(0); z-index: 200; }
 
-      /* 暗色模式下额外微调 */
-      body.dark-mode h2 { color: #e0e0e0; border-bottom-color: rgba(255,255,255,0.15); }
-      body.dark-mode .sidebar-content a { color: #b0a090; }
-      body.dark-mode .sidebar-content a:hover { color: #d0c0a0; background: rgba(255,255,255,0.1); }
-      body.dark-mode .custom-divider { background-image: linear-gradient(to right, rgba(255,255,255,0), rgba(255,255,255,0.2), rgba(255,255,255,0)); }
-      body.dark-mode .custom-divider::after { color: rgba(255,255,255,0.5); }
+      /* 暗色模式下额外微调（暖色低眩光阅读主题） */
+      body.dark-mode h2 { color: #ece5d8; border-bottom-color: rgba(236, 229, 216, 0.14); }
+      body.dark-mode .sidebar-content a { color: #b7a894; }
+      body.dark-mode .sidebar-content a:hover { color: #d8cbb6; background: rgba(255,255,255,0.06); }
+      body.dark-mode .sidebar-content a.current-chapter { color: #f0c9a6; background-color: rgba(224, 163, 122, 0.14); box-shadow: inset 3px 0 0 #e0a37a; }
+      body.dark-mode .export-btn:hover { background-color: #b85a34; box-shadow: 0 2px 6px rgba(224, 163, 122, 0.25); }
+      body.dark-mode .export-btn:disabled { background-color: #3a352e; color: #8a8177; }
+      body.dark-mode .paper-container { box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55); }
+      body.dark-mode .sidebar { border-right-color: rgba(255, 255, 255, 0.08); }
+      body.dark-mode .sidebar-header { border-bottom-color: rgba(255, 255, 255, 0.08); }
+      body.dark-mode .sidebar-content { scrollbar-color: rgba(224, 199, 168, 0.25) transparent; }
+      body.dark-mode .scroll-area { scrollbar-color: rgba(224, 199, 168, 0.2) transparent; }
+      body.dark-mode .custom-divider { background-image: linear-gradient(to right, rgba(0,0,0,0), rgba(224, 199, 168, 0.22), rgba(0,0,0,0)); }
+      body.dark-mode .custom-divider::after { color: rgba(224, 199, 168, 0.55); }
+      body.dark-mode .sidebar-content::-webkit-scrollbar-thumb { background-color: rgba(224, 199, 168, 0.22); }
+      body.dark-mode .scroll-area::-webkit-scrollbar-thumb { background-color: rgba(224, 199, 168, 0.18); }
     `;
 
     const DB_CONFIG = { name: 'TxtReaderCache', version: 1, store: 'RenderedFiles' };
@@ -196,7 +225,10 @@
 
             // 汉字间空格清理放到章节拆分之后做，
             // 这样才能区分“章节标题里的空格”（保留）和“正文中的空格”（删除）
-            const finalParas = rawMode ? splitParas : splitParas.map(p => removeCjkSpacesSmart(p));
+            const spacedParas = rawMode ? splitParas : splitParas.map(p => removeCjkSpacesSmart(p));
+            // 拆分段落内残留的空隙（被并进同一行的对话回合，如“……？」　　「……”）
+            // 以及无空隙直接粘连的对话回合（如“……”“……”），多人对话按回合独立成段
+            const finalParas = splitAdjacentDialogue(splitParagraphSpacing(spacedParas));
 
             const div = document.createElement('div');
             renderContent(div, finalParas);
@@ -548,6 +580,10 @@
         if (chapterSplit && !chapterSplit.body) {
             return text;
         }
+        // 卷名 + “第X回” 的整行标题同样保留全部空格（如“龙潜于渊 第一回 临安会”）
+        if (isVolPrefixChapterTitle(text)) {
+            return text;
+        }
 
         const HOLDER = '\uE000'; // 临时占位符（sanitizeText 已执行，不会再被清理）
         return String(text)
@@ -702,11 +738,12 @@
         const t = str.trim();
         if (t.length === 0) return false;
         if (/^第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇)/.test(t)) {
-            return t.length < 300;
+            // 正文句常出现两个及以上标记（如“第三章完成了，第四章也即将推出”），不算标题
+            return t.length < 300 && countChapterMarkers(t) <= 1;
         }
+        if (isVolPrefixChapterTitle(t)) return true;
         if (t.length > 100) return false;
-        return /^\(\d+\)/.test(t) ||
-               /^[（(][\d一二三四五六七八九十百千万]+[)）]/.test(t) ||
+        return isBracketNumberTitle(t) ||
                /^\d+\.?\s*$/.test(t) ||
                /^正文\s*【/.test(t) ||
                /^【\d+】/.test(t) ||
@@ -717,7 +754,9 @@
 
     const getBracketBalance = (str) => { let balance = 0; const openSet = new Set(['(', '（', '【', '《', '〈', '〔', '[', '{', '｛', '［']); const closeSet = new Set([')', '）', '】', '》', '〉', '〕', ']', '}', '｝', '］']); for (const char of str) { if (openSet.has(char)) balance++; else if (closeSet.has(char)) balance--; } return balance; };
 
-    for (const rawLine of lines) {
+    for (let li = 0; li < lines.length; li++) {
+        const rawLine = lines[li];
+        const nextLine = lines[li + 1] || '';
         let trimmedLine = rawLine.trim();
         if (currentPara !== '') {
             const realLastChar = currentPara.replace(/[”’」』\s]+$/, '').slice(-1); const firstChar = trimmedLine.charAt(0);
@@ -728,7 +767,10 @@
         // 只清理“整行全是 ?！ 标点”的转换残留（2 个及以上），后面跟正文的行不再删
         if (/^[?？!！]{2,}$/.test(trimmedLine)) trimmedLine = '';
         if (trimmedLine === '') { if (currentPara && getBracketBalance(currentPara) <= 0) { stitchedParas.push(currentPara); currentPara = ''; } continue; }
-        if (currentPara === '') { currentPara = trimmedLine; } else {
+        if (currentPara === '') {
+            const glued = trySplitGluedBracketLine(trimmedLine, nextLine);
+            if (glued) { stitchedParas.push(glued.title); currentPara = glued.body; } else { currentPara = trimmedLine; }
+        } else {
             let shouldMerge = false;
             if (startsWithSeparator(currentPara) || startsWithSeparator(trimmedLine) || isTitle(trimmedLine) || isTitle(currentPara)) { shouldMerge = false; }
             else if (/^[\?!\.,:;？！，。；：”’」』)）】》〉〕\]\}｝］]/.test(trimmedLine) || getBracketBalance(currentPara) > 0 || startsWithPunctuation(trimmedLine)) { shouldMerge = true; }
@@ -744,7 +786,11 @@
             if (shouldMerge) {
                 const isEng = c => /[a-zA-Z0-9]/.test(c); let joiner = (isEng(currentPara.slice(-1)) && isEng(trimmedLine[0])) ? ' ' : '';
                 if (/^[\?!\.,:;？！，。；：]+$/.test(trimmedLine)) joiner = ''; currentPara += joiner + trimmedLine;
-            } else { stitchedParas.push(currentPara); currentPara = trimmedLine; }
+            } else {
+                stitchedParas.push(currentPara);
+                const glued = trySplitGluedBracketLine(trimmedLine, nextLine);
+                if (glued) { stitchedParas.push(glued.title); currentPara = glued.body; } else { currentPara = trimmedLine; }
+            }
         }
     }
     if (currentPara !== '') stitchedParas.push(currentPara); return stitchedParas;
@@ -791,6 +837,99 @@
         return result;
     }
 
+    /** 统计未闭合引号数（“ ” 「 」 『 』 ‘ ’） */
+    function quoteBalance(str) {
+        let b = 0;
+        for (const ch of str) {
+            if (ch === '“' || ch === '「' || ch === '『' || ch === '‘') b++;
+            else if (ch === '”' || ch === '」' || ch === '』' || ch === '’') b--;
+        }
+        return Math.max(0, b);
+    }
+
+    /**
+     * 把段落内残留的“段落空隙”拆成独立段落。
+     * 旧 txt 的段落缩进是两个全角空格（　　）；当对话回合被并进同一行时，
+     * 这些空隙会残留在段落中间（如“……？」　　「……”），整段渲染成一行很难看。
+     * 为避免误切正文，只在空隙满足以下条件时才拆：
+     * 1. 空隙前以句末标点/闭合引号括号结尾，或空隙后以引号/括号开头；
+     * 2. 空隙处没有未闭合的引号。
+     */
+    function splitParagraphSpacing(paragraphs) {
+        const gapRe = /[ \t\u3000]{2,}/g;
+        const prevBoundary = /[。！？…\u2026”」』）】》〉〕\]\}｝］]$/;
+        const nextBoundary = /^[“「『‘（(【《]/;
+        const result = [];
+        for (const para of paragraphs) {
+            gapRe.lastIndex = 0;
+            let m;
+            let last = 0;
+            let split = false;
+            const segs = [];
+            while ((m = gapRe.exec(para)) !== null) {
+                const prefix = para.slice(0, m.index);
+                const after = para.slice(m.index + m[0].length);
+                const isPrevBoundary = prevBoundary.test(prefix.slice(-1));
+                const isNextBoundary = nextBoundary.test(after);
+                if (quoteBalance(prefix) === 0 && (isPrevBoundary || isNextBoundary)) {
+                    segs.push(para.slice(last, m.index).trim());
+                    last = m.index + m[0].length;
+                    split = true;
+                }
+            }
+            if (!split) {
+                result.push(para);
+                continue;
+            }
+            segs.push(para.slice(last).trim());
+            for (const s of segs) {
+                if (s) result.push(s);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 把同一行内紧挨着的多个对话回合拆成独立段落。
+     * 旧 txt 中对话回合常被并进同一行且不留空隙（如“……”“……”），
+     * 中文里一个完整引号回合结束后不可能直接跟着另一个左引号，
+     * 因此“右引号后紧跟左引号”几乎可以确定是换人说话。
+     * 为避免误切：
+     * 1. 边界前引号必须已闭合（quoteBalance 为 0）；
+     * 2. 单引号（’‘）不参与，避免拆开嵌套引号里的连续引语；
+     * 3. 拆出的片段非空才保留。
+     */
+    function splitAdjacentDialogue(paragraphs) {
+        const turnRe = /([”」』])[ \t\u3000]*([“「『])/g;
+        const result = [];
+        for (const para of paragraphs) {
+            turnRe.lastIndex = 0;
+            let m;
+            let last = 0;
+            let split = false;
+            const segs = [];
+            while ((m = turnRe.exec(para)) !== null) {
+                // prefix 含闭合引号：此时引号配平为 0 才算一个完整回合
+                const prefix = para.slice(0, m.index + 1);
+                if (quoteBalance(prefix) === 0) {
+                    segs.push(para.slice(last, m.index + 1).trim());
+                    // 只跳到闭合引号之后，把下一回合的左引号留给下一段
+                    last = m.index + 1;
+                    split = true;
+                }
+            }
+            if (!split) {
+                result.push(para);
+                continue;
+            }
+            segs.push(para.slice(last).trim());
+            for (const s of segs) {
+                if (s) result.push(s);
+            }
+        }
+        return result;
+    }
+
     function trySplitChapterLine(text) {
         const match = text.match(/^(第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇))\s*(.*)$/);
         if (!match) return null;
@@ -806,6 +945,107 @@
         }
         // 其余情况（含无标点的长标题）整行作为章节标题，不再按长度阈值误拆
         return { title: text.trim(), body: null };
+    }
+
+    /** 统计整行出现的“第X卷/章/回/集/部/篇”标记次数 */
+    function countChapterMarkers(t) {
+        const m = String(t).match(/第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇)/g);
+        return m ? m.length : 0;
+    }
+
+    /**
+     * 卷名 + 第X回/卷/集/部/篇 + 短标题 的独立标题行，如“龙潜于渊 第一回 临安会”。
+     * 刻意不包含“章”：正文里“我把第三章完成了”这类句子太常见，误判风险高；
+     * “章”格式的书通常直接用“第X章 标题”行首格式，由 ^第 分支处理。
+     * 判定约束（全部满足才算标题）：
+     * 1. 整行只出现 1 个“第X回/卷/集/部/篇”标记（正文句常出现两个及以上）；
+     * 2. 行首是 1~12 字的不含标点卷名，与标记之间可紧贴，也可用 空格/·/： 分隔；
+     * 3. 回目后缀 ≤ 24 字，且不含句读标点；
+     * 4. 整行 ≤ 48 字；以引号开头的对话行不算。
+     */
+    function isVolPrefixChapterTitle(t) {
+        const s = String(t).trim();
+        if (s.length === 0 || s.length > 48) return false;
+        if (/^["“「『]/.test(s)) return false;
+        const markerRe = /第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:回|卷|集|部|篇)/;
+        const m = markerRe.exec(s);
+        if (!m) return false;
+        if (countChapterMarkers(s) !== 1) return false;
+        const before = s.slice(0, m.index);
+        const gapMatch = before.match(/[ \t\u3000·：]?$/);
+        const gap = gapMatch ? gapMatch[0] : '';
+        const prefix = before.slice(0, before.length - gap.length);
+        const suffix = s.slice(m.index + m[0].length);
+        if (!/^[^，。！？；、…：\s]{1,12}$/.test(prefix)) return false;
+        if (!/^[ \t\u3000·：]{0,1}$/.test(gap)) return false;
+        if (suffix.length > 24 || /[，。！？；、…：;:,.!?]/.test(suffix)) return false;
+        return true;
+    }
+
+    /**
+     * “（一）标题”式章节标题：括号编号 + 短后缀，且后缀不含句读标点。
+     * 旧规则只要求行首是“（数字）”，会把“（六）杨门女将正当……，……”这类
+     * 正文段落误判成标题；加上长度与标点约束后，只保留真正的短标题。
+     * 同时剥离标题首尾的手打分隔符串（如“（十）＊＊＊＊＊＊”只取“（十）”）。
+     */
+    function cleanBracketNumberTitle(t) {
+        const s = String(t).trim();
+        const m = s.match(/^[（(][\d〇零一二三四五六七八九十百千万]+[)）]([\s\S]*)$/);
+        if (!m) return null;
+        let suffix = m[1];
+        // 去掉标题首尾的分隔符串（＊ * - = _ ~ ～ － ＝ ＿ 及空白），作者常手打星号做分页
+        suffix = suffix.replace(/^[＊\*\-=_~～－＝＿\s]+/, '').replace(/[＊\*\-=_~～－＝＿\s]+$/, '');
+        if (suffix.length > 30) return null;
+        if (/[，。！？；、：]/.test(suffix)) return null;
+        return s.slice(0, s.length - m[1].length) + suffix;
+    }
+
+    function isBracketNumberTitle(t) {
+        return cleanBracketNumberTitle(t) !== null;
+    }
+
+    /** 正文起始连接词：章回体/评书体正文常以这些词开篇 */
+    const BODY_STARTERS = ['却说那', '且说那', '只见那', '但见那', '话说那', '再说那', '却说', '话说', '且说', '只见', '但见', '忽见', '又见', '忽听', '只听', '但听', '正待', '正当', '此时', '这日', '当日', '次日', '再说', '然而', '于是', '随后', '接着'];
+
+    /** 跨行延续词：以此开头的行无法独立成句，必然承接上一行未写完的正文 */
+    const CONTINUATION_STARTERS = ['之际', '之时', '的时候'];
+
+    /**
+     * “（数字）标题 + 正文粘连”行的拆分，如：
+     *   （六）杨门女将正当西方诺曼人十字军东征，……（下一行：之际，……）
+     * 拆成 标题“（六）杨门女将” + 正文“正当西方诺曼人……”。
+     * 判定条件：
+     * 1. 行内第一个正文起始词命中处之前的标题部分为 1~8 字、无标点无空白；
+     * 2. 强信号：下一行以延续词开头（本行必然带着未写完的正文）；
+     *    或弱信号：拆分后的正文含句读标点且长度足够（正文完整落在本行内）。
+     * 条件不满足一律不拆，避免把正文误切成标题。
+     */
+    function trySplitGluedBracketLine(line, nextLine) {
+        const s = String(line).trim();
+        if (isBracketNumberTitle(s)) return null; // 已是完整短标题，无需拆分
+        const m = s.match(/^[（(][\d〇零一二三四五六七八九十百千万]+[)）]([\s\S]*)$/);
+        if (!m) return null;
+        const bracket = s.slice(0, s.length - m[1].length);
+        const suffix = m[1];
+
+        const next = String(nextLine || '').trim();
+        const hasContinuation = CONTINUATION_STARTERS.some(w => next.startsWith(w));
+
+        let hit = null;
+        for (const w of BODY_STARTERS) {
+            const idx = suffix.indexOf(w);
+            if (idx >= 0 && (hit === null || idx < hit.idx)) hit = { idx, w };
+        }
+        if (!hit) return null;
+
+        const titleText = suffix.slice(0, hit.idx);
+        const body = suffix.slice(hit.idx);
+        if (titleText.length < 1 || titleText.length > 8) return null;
+        if (/[，。！？；、：…\s＊\*\-=_~～－＝＿]/.test(titleText)) return null;
+        if (!body.trim()) return null;
+        // 没有跨行延续信号时，要求正文完整且足够“像正文”
+        if (!hasContinuation && !(body.length >= 6 && /[，。！？；]/.test(body))) return null;
+        return { title: bracket + titleText, body };
     }
 
     function splitTextSmartly(text) {
@@ -830,7 +1070,7 @@
 
         // 章节标题智能拆分
         const chapterPattern = /^第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇)/;
-        if (chapterPattern.test(t)) {
+        if (chapterPattern.test(t) && countChapterMarkers(t) <= 1) {
             const split = trySplitChapterLine(t);
             if (split) {
                 const h2 = document.createElement('h2');
@@ -850,15 +1090,23 @@
             }
         }
 
+        // 卷名 + 第X回/卷/集/部/篇 + 短标题（如“龙潜于渊 第一回 临安会”）
+        if (isVolPrefixChapterTitle(t)) {
+            const h2 = document.createElement('h2');
+            h2.textContent = t;
+            container.appendChild(h2);
+            return;
+        }
+
         // 其他标题模式
-        if ((/^\(\d+\)/.test(t) && t.length < 50) ||
-            /^[（(][\d一二三四五六七八九十百千万]+[)）]/.test(t) ||
+        const bracketTitle = cleanBracketNumberTitle(t);
+        if (bracketTitle ||
             /^正文\s*【\d+】.*$/.test(t) ||
             /^【\d+】.*$/.test(t) ||
             /^序章|^尾声/.test(t) ||
             /^.+[（(][\d一二三四五六七八九十百千万]+[)）]\s*$/.test(t)) {
             const h2 = document.createElement('h2');
-            h2.textContent = t;
+            h2.textContent = bracketTitle || t;
             container.appendChild(h2);
             return;
         }
