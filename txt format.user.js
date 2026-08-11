@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        txt format (DOM优化版)
 // @namespace   http://tampermonkey.net/
-// @version     2026-08-11.22
+// @version     2026-08-11.23
 // @description 智能格式化txt文件：自动识别章节标题、清理异常字符、保留章节标题空格，支持暗色模式与EPUB导出。版本历史见脚本头部注释。
 // @author      yolo
 // @match       file://*/*.txt
@@ -56,6 +56,9 @@
  * 2026-08-11.22 修复悬空左引号（只有“没有”）导致整段无法按句分段、
  *               渲染成“铁板一块”的问题；对“说：“”“想着：“”等引语动词
  *               引出的对话和整段引语保持原有的不拆句行为，避免引入新问题
+ * 2026-08-11.23 还原“段落分隔符”：部分 txt 转换后整本书被并成一行，
+ *               段落之间残留成串问号（如“。 ????????“）。现在把非汉字间的
+ *               连续问号串还原为空行分段；“感??受到”这类汉字间乱码保持不动
  */
 
 (function () {
@@ -231,6 +234,22 @@
                     .replace(/。{2,}/g, '……');
                 // 统一章节编号风格（阿拉伯/中文混排、前导零）
                 text = normalizeChapterNumbers(text);
+                // 还原“段落分隔符”：部分 txt 转换后段落之间残留成串问号
+                // （如“。 ????????“），把整本书并成了一行，导致无法自然分段。
+                // 这里把“非汉字之间”的连续问号串还原成空行；
+                // 汉字紧夹着的问号串（如“感??受到”）是乱码而非分隔符，
+                // 先用占位符保护，处理完再原样还原，避免把单词切成两段。
+                const inwordRuns = new Map();
+                let inwordIdx = 0;
+                text = text.replace(/([\u4e00-\u9fa5])([?？]{2,})(?=[\u4e00-\u9fa5])/g, (m, c, run) => {
+                    const key = '\uE001' + (inwordIdx++) + '\uE002';
+                    inwordRuns.set(key, run);
+                    return c + key;
+                });
+                text = text.replace(/[ \t\u3000]*[?？]{2,}[ \t\u3000]*/g, '\n\n');
+                for (const [key, run] of inwordRuns) {
+                    text = text.split(key).join(run);
+                }
             }
 
             const rawParas = stitchContinuousLines(text);
