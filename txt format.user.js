@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        txt format (DOM优化版)
 // @namespace   http://tampermonkey.net/
-// @version     2026-08-11.17
+// @version     2026-08-11.21
 // @description 智能格式化txt文件：自动识别章节标题、清理异常字符、保留章节标题空格，支持暗色模式与EPUB导出。版本历史见脚本头部注释。
 // @author      yolo
 // @match       file://*/*.txt
@@ -40,6 +40,19 @@
  *               把被并进同一行的对话回合恢复为独立段落，如“……？」　　「……”
  * 2026-08-11.17 拆分无空隙直接粘连的对话回合（如“……”“……”），
  *               多人对话按回合独立成段，避免全部挤在一段里影响阅读
+ * 2026-08-11.18 作者/书名等书籍信息行（如“作者：快乐鸟”）独立成段，
+ *               段落拼接阶段不再把它粘进相邻正文，渲染时按书籍信息处理
+ * 2026-08-11.19 修复正文中的“?!”被误当句末标点、从词中间断段的问题
+ *               （如乱码“感??受到”/“感？？受到”被拆成“我感?”+“?受到”两段）；
+ *               连续 ?! 串夹在汉字间时不再断段；半角 ?! 单独出现时
+ *               只在两侧均非汉字（如英文句）时才作为句子结束符
+ * 2026-08-11.20 补充修复：源文件在“?!”中间本身就分段/空行时
+ *               （如“我感?”与“?受到”两行），段落拼接遇到空行会强制分段；
+ *               智能模式下现在会把以 ?! 开头、且上一段没写完的残段并回上一段，
+ *               恢复被拆开的完整单词
+ * 2026-08-11.21 覆盖替换字符 U+FFFD（编码损坏时的 �/?）：残段合并规则同样
+ *               适用于以 U+FFFD 开头/结尾的段落，并在智能模式下把 U+FFFD
+ *               从正文中清除，让“感�?受到”这类词直接修复为“感受到”
  */
 
 (function () {
@@ -228,7 +241,13 @@
             const spacedParas = rawMode ? splitParas : splitParas.map(p => removeCjkSpacesSmart(p));
             // 拆分段落内残留的空隙（被并进同一行的对话回合，如“……？」　　「……”）
             // 以及无空隙直接粘连的对话回合（如“……”“……”），多人对话按回合独立成段
-            const finalParas = splitAdjacentDialogue(splitParagraphSpacing(spacedParas));
+            const dialogueParas = splitAdjacentDialogue(splitParagraphSpacing(spacedParas));
+            // 乱码“?!”把同一个词拆成两段时，源文件在“?!”中间可能恰好有分段/空行
+            // （如“我感?”+“?受到”两行），段落拼接遇到空行会强制分段；这里把
+            // 以 ?!/U+FFFD 开头、且上一段明显没写完的残段并回上一段，
+            // 再清除正文中的 U+FFFD 替换字符（原文模式不做任何修正）
+            const finalParas = (rawMode ? dialogueParas : mergeBrokenParas(dialogueParas))
+                .map(p => rawMode ? p : p.replace(/\uFFFD/g, ''));
 
             const div = document.createElement('div');
             renderContent(div, finalParas);
@@ -772,11 +791,13 @@
             if (glued) { stitchedParas.push(glued.title); currentPara = glued.body; } else { currentPara = trimmedLine; }
         } else {
             let shouldMerge = false;
-            if (startsWithSeparator(currentPara) || startsWithSeparator(trimmedLine) || isTitle(trimmedLine) || isTitle(currentPara)) { shouldMerge = false; }
+            if (startsWithSeparator(currentPara) || startsWithSeparator(trimmedLine) ||
+                isTitle(trimmedLine) || isTitle(currentPara) ||
+                isFrontMatterLine(trimmedLine) || isFrontMatterLine(currentPara)) { shouldMerge = false; }
             else if (/^[\?!\.,:;？！，。；：”’」』)）】》〉〕\]\}｝］]/.test(trimmedLine) || getBracketBalance(currentPara) > 0 || startsWithPunctuation(trimmedLine)) { shouldMerge = true; }
             // 核心修复：当前一段以句末标点结束、且下一行以引号开头时，视为对话未闭合，强制合并
             else if (isStopPunctuation(currentPara) && /^["“「『]/.test(trimmedLine) && !/[。！？…\u2026][”」』"]$/.test(currentPara.trim())) { shouldMerge = true; }
-            else if (!isStopPunctuation(currentPara) && !isTitle(currentPara)) {
+            else if (!isStopPunctuation(currentPara) && !isTitle(currentPara) && !isFrontMatterLine(currentPara)) {
                 if (currentPara.length < 500) {
                     shouldMerge = true;
                 }
@@ -930,6 +951,38 @@
         return result;
     }
 
+    /**
+     * 合并被乱码从中间拆开的相邻残段。
+     * 源文件在“?!”或替换字符 U+FFFD（编码损坏时的 �）中间可能恰好有分段/空行
+     * （如“我感?”+“?受到”两行），段落拼接阶段遇到空行会强制分段，
+     * 导致“感受”这类词被分到两个段落。
+     * 判定：当前段以 ?!/U+FFFD 开头，且上一段以同类字符或汉字结尾
+     * （说明上一段没写完），此时把当前段并回上一段。
+     */
+    function mergeBrokenParas(paragraphs) {
+        const JUNK_START = /^[?？!！\uFFFD]/;
+        const JUNK_END = /[?？!！\uFFFD]$/;
+        const result = [];
+        for (const para of paragraphs) {
+            const prev = result[result.length - 1];
+            const prevT = prev !== undefined ? prev.trim() : '';
+            // 上一段是章节标题/书籍信息行时不合并，避免标题被并进正文
+            const prevIsTitle = prevT !== '' &&
+                (/^第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇)/.test(prevT) ||
+                 isVolPrefixChapterTitle(prevT) ||
+                 cleanBracketNumberTitle(prevT) !== null ||
+                 isFrontMatterLine(prevT));
+            if (prev !== undefined && !prevIsTitle &&
+                JUNK_START.test(para.trim()) &&
+                (JUNK_END.test(prevT) || /[\u4e00-\u9fa5]$/.test(prevT))) {
+                result[result.length - 1] = prevT + para.trim();
+            } else {
+                result.push(para);
+            }
+        }
+        return result;
+    }
+
     function trySplitChapterLine(text) {
         const match = text.match(/^(第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇))\s*(.*)$/);
         if (!match) return null;
@@ -951,6 +1004,21 @@
     function countChapterMarkers(t) {
         const m = String(t).match(/第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇)/g);
         return m ? m.length : 0;
+    }
+
+    /**
+     * 书籍信息行（元数据）：如“作者：快乐鸟”“书名：梅花三弄”“简介：……”。
+     * 这类行是书名页/信息页的一部分，不是正文，段落拼接时必须保持独立，
+     * 否则会被当成上一段/下一段的延续，出现“作者：快乐鸟命中注定……”这种粘连。
+     * 判定约束：
+     * 1. 行首是常见信息字段（作者/著者/书名/简介/更新状态等），后接全角或半角冒号；
+     * 2. 整行不超过 60 字，排除正文里以这些词开头但内容很长的情况。
+     */
+    const FRONT_MATTER_RE = /^(?:作者|著者|原著|编者|译者|主编|书名|简介|内容简介|作品简介|总字数|更新时间|更新日期|更新于|连载状态|作品状态|作品类型|标签)\s*[:：]/;
+    function isFrontMatterLine(text) {
+        const s = String(text).trim();
+        if (!s || s.length > 60) return false;
+        return FRONT_MATTER_RE.test(s);
     }
 
     /**
@@ -1049,11 +1117,34 @@
     }
 
     function splitTextSmartly(text) {
-        const segments = []; let current = ''; let balance = 0; const openSet = new Set(['“', '‘', '「', '『', '(', '（', '【', '《', '〈', '〔', '[', '{', '｛', '［']); const closeSet = new Set(['”', '’', '」', '』', ')', '）', '】', '》', '〉', '〕', ']', '}', '｝', '］']); const terminators = /[。！？?!]/;
+        const segments = []; let current = ''; let balance = 0; const openSet = new Set(['“', '‘', '「', '『', '(', '（', '【', '《', '〈', '〔', '[', '{', '｛', '［']); const closeSet = new Set(['”', '’', '」', '』', ')', '）', '】', '》', '〉', '〕', ']', '}', '｝', '］']);
         for (let i = 0; i < text.length; i++) {
             const char = text[i]; current += char;
             if (openSet.has(char)) balance++; else if (closeSet.has(char)) balance = Math.max(0, balance - 1);
-            if ((balance === 0 || current.length > 800) && terminators.test(char)) {
+            // 句子结束符判定：
+            // 1. 全角“。！？”：常规句末标点，算句子结束；
+            // 2. 连续 2 个及以上的 ?! 串（全角/半角）夹在汉字中间时
+            //    （如“感？？受到”“感??受到”），是转换乱码而非问句，整串不拆；
+            // 3. 半角 ?! 单独出现时，只有两侧都不是汉字才按句子结束符处理（英文句）。
+            const isCJK = (ch) => ch !== undefined && /[\u4e00-\u9fa5]/.test(ch);
+            const isPunctRunBetweenCJK = (idx) => {
+                if (!/[？?！!]/.test(text[idx])) return false;
+                let s = idx, e = idx;
+                while (s > 0 && /[？?！!]/.test(text[s - 1])) s--;
+                while (e < text.length - 1 && /[？?！!]/.test(text[e + 1])) e++;
+                return (e - s + 1 >= 2) && isCJK(text[s - 1]) && isCJK(text[e + 1]);
+            };
+            const isTerminator = (idx) => {
+                const ch = text[idx];
+                if (ch === '。' || ch === '！' || ch === '？') {
+                    return !isPunctRunBetweenCJK(idx);
+                }
+                if (ch === '?' || ch === '!') {
+                    return !isCJK(text[idx - 1]) && !isCJK(text[idx + 1]) && !isPunctRunBetweenCJK(idx);
+                }
+                return false;
+            };
+            if ((balance === 0 || current.length > 800) && isTerminator(i)) {
                 let nextIdx = i + 1; while (nextIdx < text.length && closeSet.has(text[nextIdx])) { current += text[nextIdx]; i++; nextIdx++; balance = Math.max(0, balance - 1); }
                 if (current.trim().length > 1) { segments.push(current); current = ''; }
             }
@@ -1066,7 +1157,7 @@
         let t = stripPunctOnlyArtifacts(text); if (!t) return;
         const sepMatch = t.match(/^([\s\*\-=_~＊－＝＿～]{3,})(.*)$/s);
         if (sepMatch) { const hr = document.createElement('hr'); hr.className = 'custom-divider'; container.appendChild(hr); t = stripPunctOnlyArtifacts(sepMatch[2]); if (!t) return; }
-        if (index < 10 && (/^《.+》/.test(t) || /^书名[:：]/.test(t) || (/作者[:：]/.test(t) && t.length < 50))) { const h1 = document.createElement('h1'); h1.textContent = t; container.appendChild(h1); return; }
+        if (index < 10 && (/^《.+》/.test(t) || isFrontMatterLine(t))) { const h1 = document.createElement('h1'); h1.textContent = t; container.appendChild(h1); return; }
 
         // 章节标题智能拆分
         const chapterPattern = /^第\s*[\d〇零一二三四五六七八九十百千万两]+\s*(?:卷|章|回|集|部|篇)/;
