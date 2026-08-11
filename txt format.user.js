@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        txt format (DOM优化版)
 // @namespace   http://tampermonkey.net/
-// @version     2026-08-11.21
+// @version     2026-08-11.22
 // @description 智能格式化txt文件：自动识别章节标题、清理异常字符、保留章节标题空格，支持暗色模式与EPUB导出。版本历史见脚本头部注释。
 // @author      yolo
 // @match       file://*/*.txt
@@ -53,6 +53,9 @@
  * 2026-08-11.21 覆盖替换字符 U+FFFD（编码损坏时的 �/?）：残段合并规则同样
  *               适用于以 U+FFFD 开头/结尾的段落，并在智能模式下把 U+FFFD
  *               从正文中清除，让“感�?受到”这类词直接修复为“感受到”
+ * 2026-08-11.22 修复悬空左引号（只有“没有”）导致整段无法按句分段、
+ *               渲染成“铁板一块”的问题；对“说：“”“想着：“”等引语动词
+ *               引出的对话和整段引语保持原有的不拆句行为，避免引入新问题
  */
 
 (function () {
@@ -1118,6 +1121,29 @@
 
     function splitTextSmartly(text) {
         const segments = []; let current = ''; let balance = 0; const openSet = new Set(['“', '‘', '「', '『', '(', '（', '【', '《', '〈', '〔', '[', '{', '｛', '［']); const closeSet = new Set(['”', '’', '」', '』', ')', '）', '】', '》', '〉', '〕', ']', '}', '｝', '］']);
+        // 悬空引号处理：段末仍有未闭合的左引号时，多半是转换残留的“孤引号”
+        // （只有“没有”，如“……“这样近距离”），它会一直占用引号配平数，
+        // 导致整段无法按句子分段、渲染成铁板一块。
+        // 但“说：“”“想着：“”等引语动词引出的对话，以及整段以左引号开头的
+        // 引语，右引号可能在下一段，属于合法跨段对话，不能强行拆句。
+        const quoteOpenSet = new Set(['“', '‘', '「', '『']);
+        const quoteCloseSet = new Set(['”', '’', '」', '』']);
+        let unclosedQuoteAtEnd = false;
+        {
+            let qb = 0; const quoteStarts = [];
+            for (let qi = 0; qi < text.length; qi++) {
+                const qch = text[qi];
+                if (quoteOpenSet.has(qch)) { qb++; quoteStarts.push(qi); }
+                else if (quoteCloseSet.has(qch)) { qb = Math.max(0, qb - 1); if (quoteStarts.length > 0) quoteStarts.pop(); }
+            }
+            if (qb > 0) {
+                const lastStart = quoteStarts[quoteStarts.length - 1];
+                const prefix = text.slice(0, lastStart);
+                const speechVerb = /(?:说|道|问|答|喊|叫|唱|嚷|叹|哭|笑|骂|吼|怒|惊|应|想|念|低语|嘀咕|嘟囔|吩咐|告诉|回答|解释|补充|重复|警告|安慰|劝|哄|斥|唤|呼|吟|诵|读|背|曰)(?:着|了|过|道)?\s*[:：，,]?\s*$/;
+                const startsWithQuote = quoteOpenSet.has(text.trim().charAt(0));
+                unclosedQuoteAtEnd = !startsWithQuote && !speechVerb.test(prefix);
+            }
+        }
         for (let i = 0; i < text.length; i++) {
             const char = text[i]; current += char;
             if (openSet.has(char)) balance++; else if (closeSet.has(char)) balance = Math.max(0, balance - 1);
@@ -1144,7 +1170,7 @@
                 }
                 return false;
             };
-            if ((balance === 0 || current.length > 800) && isTerminator(i)) {
+            if ((balance === 0 || unclosedQuoteAtEnd || current.length > 800) && isTerminator(i)) {
                 let nextIdx = i + 1; while (nextIdx < text.length && closeSet.has(text[nextIdx])) { current += text[nextIdx]; i++; nextIdx++; balance = Math.max(0, balance - 1); }
                 if (current.trim().length > 1) { segments.push(current); current = ''; }
             }
